@@ -1,0 +1,5 @@
+python-dotenv==1.2.3
+aiosqlite==0.22.1
+httpx==0.28.1
+python-telegram-bot==22.8
+tzdata==2026.4
