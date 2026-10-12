@@ -1,4 +1,4 @@
-# Vigil (v0.1.0) — Semi-Autonomous AI Partner & Technical Copilot
+# Vigil (v0.1.0) — Semi-Autonomous AI Partner & Assistant
 
 Vigil adalah agen AI semi-otonom proaktif yang dirancang untuk mendampingi seorang *solo developer* atau profesional teknis. Berjalan tanpa henti (*long-running daemon*) menghubungkan antarmuka **Telegram**, model bahasa besar (LLM), sistem memori persisten bertingkat (**Markdown & SQLite FTS5**), loop detak jantung (**Autonomous Heartbeat**), dan kontrol lalu lintas pesan (**Traffic Controller**).
 
