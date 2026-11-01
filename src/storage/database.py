@@ -69,10 +69,17 @@ async def init_db(db_path: str | Path | None = None) -> None:
                 title TEXT NOT NULL,
                 due_time TEXT,
                 status TEXT DEFAULT 'pending',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
             """
         )
+
+        # Idempotent migration: ensure updated_at column exists in tasks table
+        cursor = await conn.execute("PRAGMA table_info(tasks);")
+        columns = [row[1] for row in await cursor.fetchall()]
+        if "updated_at" not in columns:
+            await conn.execute("ALTER TABLE tasks ADD COLUMN updated_at TEXT;")
 
         # Create user_dossier table
         await conn.execute(
@@ -117,9 +124,16 @@ async def init_db(db_path: str | Path | None = None) -> None:
                 id TEXT PRIMARY KEY,
                 role TEXT CHECK(role IN ('user', 'assistant')) NOT NULL,
                 content TEXT NOT NULL,
+                tool_context TEXT DEFAULT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
             """
         )
+
+        # Idempotent migration: ensure tool_context column exists in chat_history
+        cursor = await conn.execute("PRAGMA table_info(chat_history);")
+        chat_cols = [row[1] for row in await cursor.fetchall()]
+        if "tool_context" not in chat_cols:
+            await conn.execute("ALTER TABLE chat_history ADD COLUMN tool_context TEXT DEFAULT NULL;")
 
         await conn.commit()

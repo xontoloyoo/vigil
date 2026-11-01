@@ -7,11 +7,13 @@ and autonomous heartbeat reminders, and handles graceful shutdown.
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from datetime import datetime, timezone
 import logging
 from pathlib import Path
 import re
 import signal
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from src.config import config
 from src.core.eval_logger import eval_tracer
@@ -21,6 +23,11 @@ from src.core.prompts import (
     build_dossier_reconciliation_prompt,
     build_nightly_eval_prompt,
     build_nudge_prompt,
+    build_silent_memory_extraction_prompt,
+)
+from src.core.prompt_templates import (
+    SYSTEM_PROMPT_MEMORY_EXTRACTION,
+    TEMPLATE_SILENT_MEMORY_EXTRACTION,
 )
 from src.core.traffic import traffic_controller
 from src.engine.heartbeat import HeartbeatRunner
@@ -29,6 +36,7 @@ from src.storage import memory, repository
 from src.storage.database import init_db
 from src.storage.repository import (
     get_recent_chat_history,
+    get_chat_history_today,
     prune_chat_history,
     save_chat_message,
 )
@@ -36,6 +44,7 @@ from src.storage.search import (
     init_chat_history_search_index,
     init_search_index,
 )
+from src.core.utils import safe_truncate
 from src.tools.parser import parse_and_execute_tools
 from src.core.context_formatters import (
     format_nudges_for_prompt,
@@ -46,6 +55,10 @@ from src.core.context_formatters import (
     format_search_notes_limit_message,
     format_multi_search_follow_up_message,
     format_multi_search_limit_message,
+    format_history_with_tool_context,
+    format_daily_transcript_for_extraction,
+    format_existing_dossier_for_extraction,
+    format_existing_notes_index_for_extraction,
 )
 
 # Configure structured logging
@@ -74,6 +87,24 @@ def _count_search_notes_runs(actions: list[dict[str, Any]]) -> int:
     return sum(
         1 for a in actions if a.get("tool") == "search_notes" and a.get("type") == "read"
     )
+
+
+def _build_ephemeral_assistant_turn(actions: list[dict[str, Any]], fallback_text: str) -> str:
+    """Build the in-loop (ephemeral) assistant message for a read-tool turn.
+
+    Replays only the verbatim XML of read tools executed in that turn so the model
+    keeps its tool-calling pattern on the next iteration. Write tags are excluded
+    (they already ran; replaying them invites duplicate writes) and so is any intro
+    text. This message lives only in the loop `conversation`; it is never persisted
+    to chat_history nor sent to Telegram.
+    """
+    read_tags = [
+        a["raw_tag"] for a in actions if a.get("type") == "read" and a.get("raw_tag")
+    ]
+    if read_tags:
+        return "\n".join(read_tags)
+    # No read tag executed this turn (e.g. limit-only notice): keep legacy fallback.
+    return fallback_text or "(Memproses query data...)"
 
 # Instantiate default heartbeat runner
 heartbeat_runner = HeartbeatRunner(
@@ -114,8 +145,16 @@ async def handle_nightly_evaluation() -> None:
     logger.info("Executing nightly performance evaluation & memory consolidation pipeline.")
     try:
         # 1. Fetch performance data
-        completed_tasks = await repository.get_tasks_by_status(status="done", limit=20)
+        completed_tasks = await repository.get_completed_tasks_today(limit=20)
         pending_tasks = await repository.get_pending_tasks()
+
+        # Guard Clause: Silent Skip if zero task activity today and no pending tasks
+        if not completed_tasks and not pending_tasks:
+            logger.info(
+                "Nightly evaluation skipped: no tasks completed today and no active/pending tasks."
+            )
+            return
+
         daily_notes = await repository.get_recent_lab_notes(limit=10)
         current_memory = memory.read_markdown(memory.DEFAULT_MEMORY_MD)
 
@@ -137,9 +176,11 @@ async def handle_nightly_evaluation() -> None:
             raw_eval,
         )
 
-        # 4. Extract <working_memory>...</working_memory>
+        # 4. Extract <working_memory>...</working_memory> or <update_working_memory>...</update_working_memory>
         mem_match = re.search(
-            r"<working_memory>(.*?)</working_memory>", raw_eval, flags=re.DOTALL | re.IGNORECASE
+            r"<(?:update_)?working_memory>(.*?)</(?:update_)?working_memory>",
+            raw_eval,
+            flags=re.DOTALL | re.IGNORECASE,
         )
         if mem_match:
             new_memory = mem_match.group(1).strip()
@@ -156,7 +197,10 @@ async def handle_nightly_evaluation() -> None:
 
         # 5. Extract clean user review text for Telegram
         clean_eval = re.sub(
-            r"<working_memory>.*?</working_memory>", "", raw_eval, flags=re.DOTALL | re.IGNORECASE
+            r"<(?:update_)?working_memory>.*?</(?:update_)?working_memory>",
+            "",
+            raw_eval,
+            flags=re.DOTALL | re.IGNORECASE,
         ).strip()
 
         if clean_eval:
@@ -229,6 +273,181 @@ async def handle_dossier_reconciliation(user_md_path: Path | str | None = None) 
         logger.error("Error in dossier reconciliation pipeline: %s", exc, exc_info=True)
 
 
+async def run_silent_memory_extraction(
+    db_path: str | Path | None = None,
+    user_md_path: str | Path | None = None,
+) -> list[dict[str, Any]]:
+    """Silent background memory extraction pipeline executed at 23:30 local time.
+
+    1. Watermark-based Retrieval:
+       - Uses 'last_extracted_chat_rowid' watermark if present.
+       - Guarantees zero dropped messages during late-night chats (23:30-23:59).
+    2. Pre-Flight Gate:
+       - Checks unextracted/today's chat history.
+       - Skips without calling LLM if no chat history or < 2 user messages / < 40 chars.
+       - Never locks 'last_memory_extraction_date' on Pre-Flight skip, allowing later night chats.
+    3. LLM Extraction Pass (1-Turn Pass):
+       - Feeds unextracted transcript with noise filtering and read-only recall notes.
+       - Injects existing dossier and existing lab notes index for upsert-by-topic.
+    4. Strict Whitelist & Isolation:
+       - Only allows 'save_lab_note', 'record_dossier', and 'no_memory_extracted'.
+       - Blocks any hallucinated task/system actions.
+    5. 100% Silent Guarantee:
+       - Never sends Telegram messages.
+       - Never saves to chat_history table.
+    6. State Persistence upon Success:
+       - Advances 'last_extracted_chat_rowid' watermark to max_rowid.
+       - Locks 'last_memory_extraction_date' to today_str.
+    """
+    logger.info("Executing silent daily memory extraction pipeline.")
+
+    # 1. Watermark & Unextracted Messages Retrieval
+    watermark_str = await repository.get_state(
+        "last_extracted_chat_rowid", db_path=db_path
+    )
+    watermark = int(watermark_str) if watermark_str and watermark_str.isdigit() else 0
+
+    if watermark > 0:
+        messages_today = await repository.get_chat_history_since_rowid(
+            since_rowid=watermark, db_path=db_path
+        )
+    else:
+        messages_today = await repository.get_chat_history_today(db_path=db_path)
+
+    # 2. Pre-Flight Gate
+    if not messages_today:
+        logger.info("[Silent Memory Extraction] Skipped: No unextracted chat history today.")
+        return []
+
+    user_messages = [m for m in messages_today if m.get("role") == "user"]
+    total_user_chars = sum(len((m.get("content") or "").strip()) for m in user_messages)
+
+    if len(user_messages) < 2 or total_user_chars < 40:
+        logger.info(
+            "[Silent Memory Extraction] Skipped by Pre-Flight Gate: Insufficient substantive user messages (%d user messages, %d chars).",
+            len(user_messages),
+            total_user_chars,
+        )
+        return []
+
+    # 3. Prepare Context
+    raw_dossier = await repository.get_recent_dossier(limit=30, db_path=db_path)
+    raw_notes = await repository.get_recent_lab_notes(limit=30, db_path=db_path)
+
+    existing_dossier_str = format_existing_dossier_for_extraction(raw_dossier)
+    existing_notes_str = format_existing_notes_index_for_extraction(raw_notes)
+    daily_transcript_str = format_daily_transcript_for_extraction(messages_today)
+
+    # 4. Assemble 100% Isolated Extraction Prompt (No SOUL.md, No live tools, No MEMORY.md, No active_tasks)
+    messages = build_silent_memory_extraction_prompt(
+        existing_dossier=existing_dossier_str,
+        existing_lab_notes=existing_notes_str,
+        daily_transcript=daily_transcript_str,
+    )
+
+    # 5. Call LLM (1-turn pass)
+    try:
+        raw_response = await llm_client.generate_response(
+            messages, temperature=0.2, max_tokens=1500
+        )
+    except Exception as llm_exc:
+        logger.error(
+            "LLM API failure during silent memory extraction: %s",
+            llm_exc,
+            exc_info=True,
+        )
+        raise
+
+    if not raw_response or not isinstance(raw_response, str) or not raw_response.strip():
+        logger.warning(
+            "[Silent Memory Extraction] LLM returned empty response. Extraction pass aborted without locking state."
+        )
+        return []
+
+    logger.debug(
+        "[DEBUG] Raw silent memory extraction LLM response (%d chars):\n%s",
+        len(raw_response),
+        raw_response,
+    )
+
+    # 6. Parse and execute write tools with strict whitelist
+    cleaned_text, executed_actions = await parse_and_execute_tools(
+        raw_response,
+        db_path=db_path,
+        user_md_path=user_md_path,
+        allow_read_tools=False,
+        allowed_tools={"save_lab_note", "record_dossier", "no_memory_extracted"},
+    )
+
+    # 7. Lock state & update watermark on successful pass
+    tz = ZoneInfo(config.TIMEZONE)
+    today_str = datetime.now(tz).strftime("%Y-%m-%d")
+    await repository.set_state("last_memory_extraction_date", today_str, db_path=db_path)
+
+    max_rowid = max((m.get("rowid") or 0) for m in messages_today)
+    if max_rowid > 0:
+        await repository.set_state("last_extracted_chat_rowid", str(max_rowid), db_path=db_path)
+
+    now_utc_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    await repository.set_state("last_memory_extraction_timestamp", now_utc_str, db_path=db_path)
+
+    logger.info(
+        "[Silent Memory Extraction] Completed successfully. Executed %d memory actions: %s (watermark rowid: %d)",
+        len(executed_actions),
+        [a.get("tool") for a in executed_actions],
+        max_rowid,
+    )
+
+    # 8. Optional PROCESS_TRACING log notification to Telegram
+    # Only sent if config.PROCESS_TRACING is True and user was not AFK (passed Pre-Flight Gate).
+    # Never saved to chat_history.
+    is_tracing = bool(
+        getattr(config, "PROCESS_TRACING", getattr(config, "ENABLE_PROCESS_TRACING", config.enable_process_tracing))
+    )
+    if is_tracing:
+        has_mutation = any(
+            a.get("tool") in ("save_lab_note", "record_dossier") and a.get("status") == "success"
+            for a in executed_actions
+        )
+        has_no_mem = any(
+            a.get("tool") == "no_memory_extracted" and a.get("status") == "success"
+            for a in executed_actions
+        )
+        if has_mutation or has_no_mem:
+            trace_lines: list[str] = []
+            for a in executed_actions:
+                if a.get("status") != "success":
+                    continue
+                tool = a.get("tool")
+                if tool == "save_lab_note":
+                    topic = a.get("topic", "")
+                    trace_lines.append(f'💾 Menyimpan catatan: "{safe_truncate(topic, 35)}"')
+                elif tool == "record_dossier":
+                    fact = a.get("fact", "")
+                    trace_lines.append(f'👤 Mencatat profil: "{safe_truncate(fact, 35)}"')
+                elif tool == "no_memory_extracted":
+                    trace_lines.append("💤 Tidak ada memori baru yang diekstrak")
+
+            if trace_lines:
+                log_message = "🔍 [PROCESS_TRACING]\n" + "\n".join(trace_lines)
+                try:
+                    await telegram_interface.send_proactive_nudge(log_message)
+                    logger.info(
+                        "[Silent Memory Extraction] PROCESS_TRACING log delivered to Telegram (%d lines).",
+                        len(trace_lines),
+                    )
+                except Exception as tg_exc:
+                    logger.warning(
+                        "[Silent Memory Extraction] Failed to deliver PROCESS_TRACING log to Telegram: %s",
+                        tg_exc,
+                    )
+
+    return executed_actions
+
+
+handle_silent_memory_extraction = run_silent_memory_extraction
+
+
 async def handle_user_message(
     user_text: str,
     on_trace: Callable[[str], Awaitable[None]] | None = None,
@@ -259,11 +478,14 @@ async def handle_user_message(
 
         # Build id set from recent history for dedup in tool-based search_chat
         recent_history_ids: set[str] = {m["id"] for m in history if m.get("id")}
+        seen_chat_ids: list[str] = [m["id"] for m in history if m.get("id")]
+        seen_note_ids: list[str] = []
+        clean_tool_evidence: list[str] = []
 
-        # 4. Strip 'id' from history before injecting into LLM messages array
-        history_for_prompt = [
-            {"role": m["role"], "content": m["content"]} for m in history
-        ] if history else None
+        # 4. Format history with tool_context injected into user turns for the last 2 interactions
+        history_for_prompt = (
+            format_history_with_tool_context(history) if history else None
+        )
 
         # 5. Assemble chat prompt with history (no passive retrieval;
         #    all long-term memory is now accessed on-demand via tool calling)
@@ -288,10 +510,25 @@ async def handle_user_message(
         cleaned_text, executed_actions = await parse_and_execute_tools(
             raw_response,
             recent_history_ids=recent_history_ids,
+            exclude_ids=seen_chat_ids,
+            exclude_note_ids=seen_note_ids,
             on_trace=on_trace,
             search_chat_budget=MAX_SEARCH_CHAT_CALLS,
             search_notes_budget=MAX_SEARCH_NOTES_CALLS,
         )
+        for a in executed_actions:
+            if a.get("tool") == "search_chat" and a.get("returned_ids"):
+                for rid in a["returned_ids"]:
+                    if rid not in seen_chat_ids:
+                        seen_chat_ids.append(rid)
+            elif a.get("tool") == "search_notes" and a.get("returned_ids"):
+                for rid in a["returned_ids"]:
+                    if rid not in seen_note_ids:
+                        seen_note_ids.append(rid)
+            if a.get("type") == "read" and a.get("status") == "success" and a.get("count", 0) > 0 and a.get("read_result"):
+                if a["read_result"] not in clean_tool_evidence:
+                    clean_tool_evidence.append(a["read_result"])
+
         session.record_turn(
             turn_num=1,
             raw_llm_response=raw_response,
@@ -350,6 +587,17 @@ async def handle_user_message(
             results_block = "\n\n".join(read_results)
             has_chat_action = any(a.get("tool") == "search_chat" for a in turn_actions)
             has_notes_action = any(a.get("tool") == "search_notes" for a in turn_actions)
+            chat_has_results = any(
+                a.get("tool") == "search_chat" and a.get("count", 0) > 0
+                for a in turn_actions
+            )
+            notes_has_results = any(
+                a.get("tool") == "search_notes" and a.get("count", 0) > 0
+                for a in turn_actions
+            )
+            any_search_has_results = chat_has_results or notes_has_results
+            can_search_notes = search_notes_used < MAX_SEARCH_NOTES_CALLS
+            can_search_chat = search_chat_used < MAX_SEARCH_CHAT_CALLS
 
             if legacy_read:
                 follow_up_content = format_follow_up_user_message(results_block)
@@ -369,6 +617,7 @@ async def handle_user_message(
                         chat_max=MAX_SEARCH_CHAT_CALLS,
                         notes_used=search_notes_used,
                         notes_max=MAX_SEARCH_NOTES_CALLS,
+                        has_results=any_search_has_results,
                     )
             elif has_notes_action:
                 if notes_limit_reached:
@@ -382,7 +631,11 @@ async def handle_user_message(
                     )
                 else:
                     follow_up_content = format_search_notes_follow_up_message(
-                        results_block, search_notes_used, MAX_SEARCH_NOTES_CALLS
+                        results_block,
+                        search_notes_used,
+                        MAX_SEARCH_NOTES_CALLS,
+                        has_results=notes_has_results,
+                        can_search_chat=can_search_chat,
                     )
             else:
                 if chat_limit_reached:
@@ -396,14 +649,18 @@ async def handle_user_message(
                     )
                 else:
                     follow_up_content = format_search_chat_follow_up_message(
-                        results_block, search_chat_used, MAX_SEARCH_CHAT_CALLS
+                        results_block,
+                        search_chat_used,
+                        MAX_SEARCH_CHAT_CALLS,
+                        has_results=chat_has_results,
+                        can_search_notes=can_search_notes,
                     )
 
             logger.info("Read tools returned %d results, making follow-up LLM call.", len(read_results))
             conversation = conversation + [
                 {
                     "role": "assistant",
-                    "content": turn_text or "(Memproses query data...)",
+                    "content": _build_ephemeral_assistant_turn(turn_actions, turn_text),
                 },
                 {
                     "role": "user",
@@ -425,12 +682,26 @@ async def handle_user_message(
                     raw_response_2,
                     allow_read_tools=False,
                     recent_history_ids=recent_history_ids,
+                    exclude_ids=seen_chat_ids,
+                    exclude_note_ids=seen_note_ids,
                     on_trace=on_trace,
                     search_chat_budget=MAX_SEARCH_CHAT_CALLS - search_chat_used,
                     search_notes_budget=MAX_SEARCH_NOTES_CALLS - search_notes_used,
                 )
                 search_chat_used += _count_search_chat_runs(turn_actions)
                 search_notes_used += _count_search_notes_runs(turn_actions)
+                for a in turn_actions:
+                    if a.get("tool") == "search_chat" and a.get("returned_ids"):
+                        for rid in a["returned_ids"]:
+                            if rid not in seen_chat_ids:
+                                seen_chat_ids.append(rid)
+                    elif a.get("tool") == "search_notes" and a.get("returned_ids"):
+                        for rid in a["returned_ids"]:
+                            if rid not in seen_note_ids:
+                                seen_note_ids.append(rid)
+                    if a.get("type") == "read" and a.get("status") == "success" and a.get("count", 0) > 0 and a.get("read_result"):
+                        if a["read_result"] not in clean_tool_evidence:
+                            clean_tool_evidence.append(a["read_result"])
             if turn_text and turn_text.strip():
                 cleaned_text = turn_text
                 executed_actions.extend(turn_actions)
@@ -460,7 +731,11 @@ async def handle_user_message(
         await save_chat_message("user", user_text)
         if has_meaningful_content:
             # Only save meaningful assistant responses, not generic fallbacks
-            await save_chat_message("assistant", cleaned_text.strip())
+            tool_ctx = "\n\n".join(clean_tool_evidence) if clean_tool_evidence else None
+            if tool_ctx is not None:
+                await save_chat_message("assistant", cleaned_text.strip(), tool_context=tool_ctx)
+            else:
+                await save_chat_message("assistant", cleaned_text.strip())
 
         # 11. Fix 2: Prune old chat history to prevent unbounded growth
         pruned = await prune_chat_history(keep_latest=500)
@@ -517,6 +792,7 @@ async def main() -> None:
     heartbeat_runner.register_dispatch_callback(handle_heartbeat_dispatch)
     heartbeat_runner.register_nightly_eval_callback(handle_nightly_evaluation)
     heartbeat_runner.register_dossier_reconcile_callback(handle_dossier_reconciliation)
+    heartbeat_runner.register_memory_extraction_callback(run_silent_memory_extraction)
     telegram_interface.register_message_handler(handle_user_message)
 
     # 3. Setup graceful shutdown triggers

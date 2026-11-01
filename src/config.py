@@ -46,7 +46,11 @@ class Config:
     database_path: str = os.getenv("DATABASE_PATH", "data/vigil.db")
     heartbeat_interval_minutes: int = _get_int("HEARTBEAT_INTERVAL_MINUTES", 15) or 15
     timezone: str = os.getenv("TIMEZONE", "Asia/Jakarta")
-    enable_process_tracing: bool = _get_bool("ENABLE_PROCESS_TRACING", False)
+    memory_extraction_time: str = os.getenv("MEMORY_EXTRACTION_TIME", "23:30")
+    enable_process_tracing: bool = (
+        _get_bool("ENABLE_PROCESS_TRACING", False)
+        or _get_bool("PROCESS_TRACING", False)
+    )
     enable_eval_log: bool = _get_bool("ENABLE_EVAL_LOG", False)
     eval_log_path: str = os.getenv("EVAL_LOG_PATH", "logs/agent_eval.md")
     log_level: str = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -85,7 +89,15 @@ class Config:
         return self.timezone
 
     @property
+    def MEMORY_EXTRACTION_TIME(self) -> str:
+        return self.memory_extraction_time
+
+    @property
     def ENABLE_PROCESS_TRACING(self) -> bool:
+        return self.enable_process_tracing
+
+    @property
+    def PROCESS_TRACING(self) -> bool:
         return self.enable_process_tracing
 
     @property

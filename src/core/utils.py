@@ -1,5 +1,9 @@
 """Shared utility functions for vigil."""
 
+from __future__ import annotations
+
+from typing import Any
+
 
 def safe_truncate(text: str, max_chars: int = 1500) -> str:
     """Return text fully intact if within budget; truncate at word boundary if anomalously long.
@@ -123,3 +127,62 @@ def markdown_to_telegram_html(text: str) -> str:
         processed = processed.replace(key, val)
 
     return processed
+
+
+def to_local_timestamp_str(created_at_val: Any) -> str:
+    """Convert UTC created_at (from SQLite) to local config.TIMEZONE formatted string.
+
+    Supports datetime objects and strings (%Y-%m-%d %H:%M:%S, ISO, etc.).
+    Returns original string / representation if missing or unparseable.
+    """
+    if not created_at_val:
+        return ""
+
+    from datetime import datetime, timezone
+    from zoneinfo import ZoneInfo
+    from src.config import config
+
+    if isinstance(created_at_val, datetime):
+        dt = created_at_val
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        tz = ZoneInfo(config.TIMEZONE)
+        return dt.astimezone(tz).strftime("%Y-%m-%d %H:%M:%S")
+
+    s = str(created_at_val).strip()
+    if not s:
+        return ""
+
+    # Try ISO parsing first (supports +00:00, Z, etc.)
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        tz = ZoneInfo(config.TIMEZONE)
+        if len(s) <= 16 and ":" in s:
+            return dt.astimezone(tz).strftime("%Y-%m-%d %H:%M")
+        return dt.astimezone(tz).strftime("%Y-%m-%d %H:%M:%S")
+    except (ValueError, TypeError):
+        pass
+
+    for fmt in (
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M:%S.%f",
+        "%Y-%m-%dT%H:%M:%S.%f",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%dT%H:%M",
+    ):
+        try:
+            dt = datetime.strptime(s, fmt)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            tz = ZoneInfo(config.TIMEZONE)
+            if len(s) <= 16 and ":" in s:
+                return dt.astimezone(tz).strftime("%Y-%m-%d %H:%M")
+            return dt.astimezone(tz).strftime("%Y-%m-%d %H:%M:%S")
+        except (ValueError, TypeError):
+            pass
+
+    return s
+

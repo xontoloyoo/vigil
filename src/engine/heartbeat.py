@@ -96,6 +96,7 @@ class HeartbeatRunner:
         self._dispatch_callback: Callable[[dict[str, Any]], Awaitable[None]] | None = None
         self._nightly_eval_callback: Callable[[], Awaitable[None]] | None = None
         self._dossier_reconcile_callback: Callable[[], Awaitable[None]] | None = None
+        self._memory_extraction_callback: Callable[[], Awaitable[None]] | None = None
 
     def register_dispatch_callback(
         self, callback: Callable[[dict[str, Any]], Awaitable[None]]
@@ -114,6 +115,12 @@ class HeartbeatRunner:
     ) -> None:
         """Register the asynchronous callback for performing weekly/threshold dossier reconciliation."""
         self._dossier_reconcile_callback = callback
+
+    def register_memory_extraction_callback(
+        self, callback: Callable[[], Awaitable[None]]
+    ) -> None:
+        """Register the asynchronous callback for performing silent memory extraction."""
+        self._memory_extraction_callback = callback
 
     def mark_dispatched(
         self, task_id: str, timestamp: datetime | None = None
@@ -296,6 +303,96 @@ class HeartbeatRunner:
             logger.error("Error checking dossier reconciliation state: %s", exc, exc_info=True)
             return False
 
+    async def check_silent_memory_extraction(self) -> bool:
+        """Check if it's time for silent daily memory extraction (>= 23:30) and execute once per day."""
+        tz = ZoneInfo(config.TIMEZONE)
+        now_local = datetime.now(tz)
+        today_str = now_local.strftime("%Y-%m-%d")
+
+        target_hour = 23
+        target_minute = 30
+        if hasattr(config, "MEMORY_EXTRACTION_TIME") and config.MEMORY_EXTRACTION_TIME:
+            try:
+                parts = config.MEMORY_EXTRACTION_TIME.strip().split(":")
+                target_hour = int(parts[0])
+                target_minute = int(parts[1])
+            except Exception:
+                target_hour = 23
+                target_minute = 30
+
+        if (now_local.hour < target_hour) or (
+            now_local.hour == target_hour and now_local.minute < target_minute
+        ):
+            return False
+
+        try:
+            last_extracted = await repository.get_state(
+                "last_memory_extraction_date", db_path=self.db_path
+            )
+            if last_extracted == today_str:
+                return False
+
+            # Active chat cooldown / debounce:
+            # If the user is actively chatting (< 3 minutes ago) and it's not yet late (< :50),
+            # delay extraction to the next heartbeat cycle so we don't slice ongoing conversations.
+            if now_local.minute < 50:
+                latest_chat = await repository.get_latest_chat_message(db_path=self.db_path)
+                if latest_chat and latest_chat.get("created_at"):
+                    created_at_raw = latest_chat["created_at"]
+                    try:
+                        created_dt = datetime.fromisoformat(created_at_raw.replace("Z", "+00:00"))
+                        if created_dt.tzinfo is None:
+                            created_dt = created_dt.replace(tzinfo=timezone.utc)
+                        now_utc = datetime.now(timezone.utc)
+                        diff_sec = (now_utc - created_dt).total_seconds()
+                        if 0 <= diff_sec < 180:
+                            logger.info(
+                                "[Silent Memory Extraction] User actively chatting (last message %.1fs ago). Debouncing to next heartbeat cycle.",
+                                diff_sec,
+                            )
+                            return False
+                    except Exception:
+                        pass
+
+            logger.info(
+                "Triggering silent daily memory extraction for date: %s (local time: %s)",
+                today_str,
+                now_local.strftime("%H:%M:%S"),
+            )
+
+            result = None
+            if self._memory_extraction_callback:
+                try:
+                    result = await self._memory_extraction_callback()
+                except Exception as cb_exc:
+                    logger.error(
+                        "Error in silent memory extraction callback: %s",
+                        cb_exc,
+                        exc_info=True,
+                    )
+                    # Do NOT lock state on error to allow retry on subsequent heartbeat cycles
+                    return False
+
+            # Check if callback already locked state (e.g. run_silent_memory_extraction)
+            last_extracted_after = await repository.get_state(
+                "last_memory_extraction_date", db_path=self.db_path
+            )
+            if last_extracted_after == today_str:
+                return True
+
+            # If callback was a custom mock that returned a truthy/non-empty value (e.g. unit test AsyncMock):
+            if result is not None and result is not False and result != []:
+                await repository.set_state(
+                    "last_memory_extraction_date", today_str, db_path=self.db_path
+                )
+                return True
+
+            # If skipped by Pre-Flight Gate (result == []), do NOT lock state
+            return False
+        except Exception as exc:
+            logger.error("Error checking silent memory extraction state: %s", exc, exc_info=True)
+            return False
+
     async def _run_loop(self) -> None:
         """Continuous execution loop running at check_interval_seconds."""
         logger.info("Heartbeat loop started (interval: %ds).", self.check_interval_seconds)
@@ -314,6 +411,11 @@ class HeartbeatRunner:
                 await self.check_dossier_reconciliation()
             except Exception as exc:
                 logger.error("Unexpected error in dossier reconciliation cycle: %s", exc, exc_info=True)
+
+            try:
+                await self.check_silent_memory_extraction()
+            except Exception as exc:
+                logger.error("Unexpected error in silent memory extraction cycle: %s", exc, exc_info=True)
 
             try:
                 await asyncio.sleep(self.check_interval_seconds)

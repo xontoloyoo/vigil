@@ -23,6 +23,8 @@ from src.core.prompt_templates import (
     TEMPLATE_ACTIVE_TASK_DUE,
     TEMPLATE_ACTIVE_TASK_NO_DUE,
     TEMPLATE_EXTRA_CONTEXT,
+    TEMPLATE_HISTORY_WINDOW_NOTE,
+    TEMPLATE_HISTORY_WINDOW_EMPTY_NOTE,
     TEMPLATE_CONTEXT_MERGING_DIRECTIVE,
     TEMPLATE_NUDGE_SYSTEM,
     TEMPLATE_NUDGE_USER,
@@ -31,6 +33,8 @@ from src.core.prompt_templates import (
     TEMPLATE_NIGHTLY_NOTES_SECTION,
     TEMPLATE_RECONCILE_DOSSIER_SYSTEM,
     TEMPLATE_RECONCILE_DOSSIER_USER,
+    SYSTEM_PROMPT_MEMORY_EXTRACTION,
+    TEMPLATE_SILENT_MEMORY_EXTRACTION,
 )
 
 # Project root path resolution
@@ -103,11 +107,22 @@ def build_chat_prompt(
 
     Layout:
     1. Static Prefix (Cacheable): Persona + XML Tools Spec
-    2. Dynamic Context: Current Time, User Profile, Tasks Snapshot, Retrieval Context, Context Merging Directive
+    2. Dynamic Context: Current Time, User Profile, Tasks Snapshot, Retrieval Context,
+       Context Merging Directive, Chat History Window Note
     3. Chat History (previous turns)
     4. User Message (current turn)
     """
     static_prefix = build_static_system_prefix()
+
+    # Validate history first so the window note reports the exact visible message count.
+    validated: list[dict[str, str]] = [
+        msg
+        for msg in (history or [])
+        if isinstance(msg, dict)
+        and msg.get("role") in ("user", "assistant")
+        and isinstance(msg.get("content"), str)
+        and msg["content"].strip()
+    ]
 
     dynamic_sections: list[str] = [
         TEMPLATE_SYSTEM_CONTEXT_TIME.format(time_str=_get_current_time_str()),
@@ -138,21 +153,17 @@ def build_chat_prompt(
     if pending_nudge:
         dynamic_sections.append(TEMPLATE_CONTEXT_MERGING_DIRECTIVE.format(pending_nudge=pending_nudge))
 
+    # Placed last so it sits directly above the history messages.
+    if validated:
+        dynamic_sections.append(TEMPLATE_HISTORY_WINDOW_NOTE.format(count=len(validated)))
+    else:
+        dynamic_sections.append(TEMPLATE_HISTORY_WINDOW_EMPTY_NOTE)
+
     dynamic_block = "\n\n".join(dynamic_sections)
     system_prompt = f"{static_prefix}\n\n---\n\n{dynamic_block}".strip()
 
     messages: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
-
-    if history:
-        validated = [
-            msg
-            for msg in history
-            if isinstance(msg, dict)
-            and msg.get("role") in ("user", "assistant")
-            and isinstance(msg.get("content"), str)
-            and msg["content"].strip()
-        ]
-        messages.extend(validated)
+    messages.extend(validated)
 
     messages.append({"role": "user", "content": user_message})
 
@@ -253,15 +264,14 @@ def build_nightly_eval_prompt(
 
 def build_dossier_reconciliation_prompt(
     raw_dossier: str,
+    soul: str | None = None,
 ) -> list[dict[str, str]]:
-    """Assemble user dossier reconciliation and deduplication prompt."""
-    soul = load_soul_prompt()
+    """Assemble user dossier reconciliation and deduplication prompt without SOUL persona."""
     time_str = _get_current_time_str()
 
     clean_raw = raw_dossier.strip() if raw_dossier.strip() else "(No user dossier records)"
 
     system_content = TEMPLATE_RECONCILE_DOSSIER_SYSTEM.format(
-        soul=soul,
         time_str=time_str,
         raw_dossier=clean_raw,
     )
@@ -269,5 +279,28 @@ def build_dossier_reconciliation_prompt(
     return [
         {"role": "system", "content": system_content},
         {"role": "user", "content": TEMPLATE_RECONCILE_DOSSIER_USER},
+    ]
+
+
+def build_silent_memory_extraction_prompt(
+    existing_dossier: str,
+    existing_lab_notes: str,
+    daily_transcript: str,
+) -> list[dict[str, str]]:
+    """Assemble 100% isolated payload for silent memory extraction (23:30 WIB).
+
+    Excludes SOUL.md, MEMORY.md, active_tasks, and live chat tools.
+    Returns:
+    - 1 system prompt declaring the silent extraction engine role.
+    - 1 user instruction containing the daily transcript and extraction directives.
+    """
+    user_content = TEMPLATE_SILENT_MEMORY_EXTRACTION.format(
+        existing_dossier=existing_dossier,
+        existing_lab_notes=existing_lab_notes,
+        daily_transcript=daily_transcript,
+    )
+    return [
+        {"role": "system", "content": SYSTEM_PROMPT_MEMORY_EXTRACTION},
+        {"role": "user", "content": user_content},
     ]
 

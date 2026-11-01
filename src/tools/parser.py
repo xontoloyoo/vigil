@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 # Pattern to capture supported XML tool tags and their contents
 _TOOL_TAG_PATTERN = re.compile(
-    r"<(?P<tag>record_dossier|save_lab_note|create_task|update_task|update_working_memory"
+    r"<(?P<tag>record_dossier|save_lab_note|create_task|update_task|delete_task|update_working_memory"
     r"|query_tasks|search_notes|get_dossier|search_chat)"
     r"(?P<attrs>[^>]*)>"
     r"(?P<content>.*?)"
@@ -33,7 +33,13 @@ _TOOL_TAG_PATTERN = re.compile(
 )
 
 # Pattern to extract key="value" or key='value' attributes from a tag
-_ATTR_PATTERN = re.compile(r'(\w+)=["\']([^"\']*)["\']')
+_ATTR_PATTERN = re.compile(r'([a-zA-Z0-9_-]+)=["\']([^"\']*)["\']')
+
+# Pattern to capture <no_memory_extracted/> (self-closing or paired)
+_NO_MEMORY_EXTRACTED_PATTERN = re.compile(
+    r"<no_memory_extracted\s*(?:/>|>(?:.*?)</no_memory_extracted>)",
+    flags=re.DOTALL | re.IGNORECASE,
+)
 
 
 def _parse_attributes(attrs_str: str) -> dict[str, str]:
@@ -43,8 +49,11 @@ def _parse_attributes(attrs_str: str) -> dict[str, str]:
 
 def _clean_response_text(raw_text: str) -> str:
     """Remove tool XML tags and normalize whitespace."""
+    if not raw_text or not isinstance(raw_text, str):
+        return ""
     # Strip tool tags
     text_without_tags = _TOOL_TAG_PATTERN.sub("", raw_text)
+    text_without_tags = _NO_MEMORY_EXTRACTED_PATTERN.sub("", text_without_tags)
 
     # Trim trailing whitespace on each line
     lines = [line.rstrip() for line in text_without_tags.splitlines()]
@@ -83,9 +92,12 @@ async def parse_and_execute_tools(
     memory_md_path: str | Path | None = None,
     allow_read_tools: bool = True,
     recent_history_ids: set[str] | None = None,
+    exclude_ids: list[str] | set[str] | None = None,
+    exclude_note_ids: list[str] | set[str] | None = None,
     on_trace: Callable[[str], Awaitable[None]] | None = None,
     search_chat_budget: int | None = None,
     search_notes_budget: int | None = None,
+    allowed_tools: set[str] | list[str] | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
     """Parse XML action tags from raw model response, execute them asynchronously,
 
@@ -94,12 +106,40 @@ async def parse_and_execute_tools(
     search_chat_budget / search_notes_budget: when None, tools follow allow_read_tools (legacy).
     When an int, the tool runs at most that many times in this call regardless
     of allow_read_tools; extra attempts are recorded with status="limit_reached".
+    allowed_tools: optional whitelist of permitted tool names. If provided, any tool not in
+    this set is blocked from execution and recorded with status="blocked".
     """
+    if not raw_response or not isinstance(raw_response, str):
+        return "", []
+
     executed_actions: list[dict[str, Any]] = []
     target_user_md = Path(user_md_path or memory.DEFAULT_USER_MD)
     target_memory_md = Path(memory_md_path or memory.DEFAULT_MEMORY_MD)
     search_chat_remaining = search_chat_budget
     search_notes_remaining = search_notes_budget
+    effective_exclude_ids = set(exclude_ids or ()) | set(recent_history_ids or ())
+    whitelist = set(allowed_tools) if allowed_tools is not None else None
+
+    # Check for <no_memory_extracted/> tags
+    for _ in _NO_MEMORY_EXTRACTED_PATTERN.finditer(raw_response):
+        if whitelist is not None and "no_memory_extracted" not in whitelist:
+            logger.warning("[Security] Unauthorized tool <no_memory_extracted> blocked by allowed_tools filter.")
+            executed_actions.append(
+                {
+                    "tool": "no_memory_extracted",
+                    "status": "blocked",
+                    "error": "Tool 'no_memory_extracted' is not permitted in this execution context",
+                }
+            )
+            continue
+        executed_actions.append(
+            {
+                "tool": "no_memory_extracted",
+                "status": "success",
+            }
+        )
+    if on_trace and any(a.get("tool") == "no_memory_extracted" and a.get("status") == "success" for a in executed_actions):
+        await on_trace("💤 Tidak ada memori baru yang diekstrak")
 
     # Find all tool tag matches
     matches = list(_TOOL_TAG_PATTERN.finditer(raw_response))
@@ -109,6 +149,7 @@ async def parse_and_execute_tools(
         raw_attrs = match.group("attrs")
         content = match.group("content").strip()
         attrs = _parse_attributes(raw_attrs)
+        actions_before = len(executed_actions)
 
         logger.debug(
             "[DEBUG] Tool tag detected: <%s> attrs=%s content_length=%d\n  content: %s",
@@ -117,6 +158,17 @@ async def parse_and_execute_tools(
             len(content),
             content,
         )
+
+        if whitelist is not None and tag_name not in whitelist:
+            logger.warning("[Security] Unauthorized tool <%s> blocked by allowed_tools filter.", tag_name)
+            executed_actions.append(
+                {
+                    "tool": tag_name,
+                    "status": "blocked",
+                    "error": f"Tool '{tag_name}' is not permitted in this execution context",
+                }
+            )
+            continue
 
         try:
             if tag_name == "record_dossier":
@@ -255,6 +307,28 @@ async def parse_and_execute_tools(
                     else:
                         await on_trace(f"📋 Memperbarui tugas [{task_id}] -> {new_status}")
 
+            elif tag_name == "delete_task":
+                task_id = attrs.get("id", "").strip() or content.strip()
+                if not task_id:
+                    executed_actions.append(
+                        {
+                            "tool": "delete_task",
+                            "status": "error",
+                            "error": "Missing task ID for deletion",
+                        }
+                    )
+                    continue
+                deleted = await repository.delete_task(task_id, db_path=db_path)
+                executed_actions.append(
+                    {
+                        "tool": "delete_task",
+                        "status": "success" if deleted else "not_found",
+                        "id": task_id,
+                    }
+                )
+                if on_trace and deleted:
+                    await on_trace(f"🗑️ Menghapus tugas [{task_id}]")
+
             elif tag_name == "update_working_memory":
                 if not content:
                     executed_actions.append(
@@ -312,25 +386,40 @@ async def parse_and_execute_tools(
                 if search_notes_remaining is not None:
                     search_notes_remaining -= 1
                 search_query = content.strip()
-                # Hard-lock: max 3 rows regardless of LLM request
-                limit_val = 3
+                is_browse = not search_query or search_query == "*"
+                effective_exclude_note_ids = list(exclude_note_ids or ())
 
-                if not search_query:
-                    executed_actions.append(
-                        {
-                            "tool": "search_notes",
-                            "type": "read",
-                            "status": "error",
-                            "error": "Empty search query",
-                            "read_result": "🔍 Error: Query pencarian kosong.",
-                        }
+                if is_browse:
+                    if "limit" in attrs:
+                        try:
+                            parsed_lim = int(attrs["limit"])
+                        except ValueError:
+                            parsed_lim = 10
+                        limit_val = min(max(parsed_lim, 10), 15)
+                    else:
+                        limit_val = 10
+
+                    results = await repository.get_recent_lab_notes(
+                        limit=limit_val,
+                        exclude_ids=effective_exclude_note_ids,
+                        db_path=db_path,
                     )
-                    continue
+                else:
+                    try:
+                        limit_val = int(attrs.get("limit", "3"))
+                    except ValueError:
+                        limit_val = 3
+                    limit_val = min(max(1, limit_val), 10)
 
-                results = await search_lab_notes(
-                    query=search_query, limit=limit_val, db_path=db_path
-                )
+                    results = await search_lab_notes(
+                        query=search_query,
+                        limit=limit_val,
+                        exclude_ids=effective_exclude_note_ids,
+                        db_path=db_path,
+                    )
+
                 result_text = format_search_notes_result(results, search_query)
+                returned_ids = [str(r["id"]) for r in results if r.get("id")]
 
                 executed_actions.append(
                     {
@@ -339,10 +428,14 @@ async def parse_and_execute_tools(
                         "status": "success",
                         "read_result": result_text,
                         "count": len(results),
+                        "returned_ids": returned_ids,
                     }
                 )
                 if on_trace:
-                    await on_trace(f'🔍 Mencari catatan: "{safe_truncate(search_query, 35)}"')
+                    if search_query and search_query != "*":
+                        await on_trace(f'🔍 Mencari catatan: "{safe_truncate(search_query, 35)}"')
+                    else:
+                        await on_trace("🔍 Menjelajahi katalog catatan teknis")
 
             elif tag_name == "search_notes" and search_notes_remaining is not None:
                 # Budget exhausted: not executed; reported so the orchestrator can inform the LLM.
@@ -391,42 +484,63 @@ async def parse_and_execute_tools(
                 if search_chat_remaining is not None:
                     search_chat_remaining -= 1
                 search_query = content.strip()
-                # Hard-lock: max 3 rows regardless of LLM request
-                limit_val = 3
 
-                if not search_query:
-                    executed_actions.append(
-                        {
-                            "tool": "search_chat",
-                            "type": "read",
-                            "status": "error",
-                            "error": "Empty search query",
-                            "read_result": "🔍 Error: Query pencarian kosong.",
-                        }
-                    )
-                    continue
+                date_val = attrs.get("date")
+                if date_val:
+                    date_val = date_val.strip()
 
+                raw_days_ago = attrs.get("days_ago") or attrs.get("days-ago")
+                days_ago_val: int | None = None
+                if raw_days_ago is not None:
+                    try:
+                        days_ago_val = int(raw_days_ago.strip())
+                    except ValueError:
+                        days_ago_val = None
+
+                try:
+                    limit_val = int(attrs.get("limit", "3"))
+                except ValueError:
+                    limit_val = 3
+                limit_val = min(max(1, limit_val), 10)
+
+                # Bounded over-fetch: request target limit + recent history size to prevent premature truncation
+                fetch_limit = limit_val + (len(effective_exclude_ids) if effective_exclude_ids else 0)
                 results = await search_chat_history(
-                    query=search_query, limit=limit_val, db_path=db_path
+                    query=search_query,
+                    limit=fetch_limit,
+                    date_str=date_val,
+                    days_ago=days_ago_val,
+                    exclude_ids=effective_exclude_ids,
+                    db_path=db_path,
                 )
 
-                # Dedup: filter out messages already in the recent 8-message history
-                if recent_history_ids and results:
+                # Dedup safety net: filter out messages already in exclude_ids
+                if effective_exclude_ids and results:
                     pre_dedup = len(results)
                     results = [
                         r for r in results
-                        if r.get("id") not in recent_history_ids
+                        if r.get("id") not in effective_exclude_ids
                     ]
                     dedup_removed = pre_dedup - len(results)
                     if dedup_removed > 0:
                         logger.info(
-                            "search_chat dedup: %d → %d (%d already in recent history)",
+                            "search_chat dedup: %d → %d (%d already in excluded history)",
                             pre_dedup,
                             len(results),
                             dedup_removed,
                         )
 
+                # Slice to the desired final limit
+                results = results[:limit_val]
+
                 result_text = format_search_chat_result(results, search_query)
+
+                returned_ids: list[str] = []
+                for r in results:
+                    if r.get("id"):
+                        returned_ids.append(r["id"])
+                    if r.get("paired_message") and r["paired_message"].get("id"):
+                        returned_ids.append(r["paired_message"]["id"])
 
                 executed_actions.append(
                     {
@@ -435,10 +549,18 @@ async def parse_and_execute_tools(
                         "status": "success",
                         "read_result": result_text,
                         "count": len(results),
+                        "returned_ids": returned_ids,
                     }
                 )
                 if on_trace:
-                    await on_trace(f'💬 Mencari riwayat obrolan: "{safe_truncate(search_query, 35)}"')
+                    if search_query:
+                        await on_trace(f'💬 Mencari riwayat obrolan: "{safe_truncate(search_query, 35)}"')
+                    elif days_ago_val is not None:
+                        await on_trace(f'💬 Menelusuri riwayat obrolan ({days_ago_val} hari lalu)')
+                    elif date_val:
+                        await on_trace(f'💬 Menelusuri riwayat obrolan tanggal {date_val}')
+                    else:
+                        await on_trace('💬 Menelusuri riwayat obrolan terdahulu')
 
             elif tag_name == "search_chat" and search_chat_remaining is not None:
                 # Budget exhausted: not executed; reported so the orchestrator can inform the LLM.
@@ -460,6 +582,13 @@ async def parse_and_execute_tools(
                     "content": content,
                 }
             )
+        finally:
+            # Attach the verbatim XML tag to executed read actions so the orchestrator
+            # can replay it in the ephemeral multi-turn loop (never persisted).
+            # Runs on `continue` paths too; write / limit_reached actions are skipped.
+            for action in executed_actions[actions_before:]:
+                if action.get("type") == "read":
+                    action["raw_tag"] = match.group(0)
 
     cleaned_text = _clean_response_text(raw_response)
     return cleaned_text, executed_actions
