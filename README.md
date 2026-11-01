@@ -1,6 +1,6 @@
-# Vigil (v0.1.0) — Semi-Autonomous AI Partner & Assistant
+# Vigil (v0.1.1) — Autonomous Accountability Partner & Long-Term Memory Assistant
 
-Vigil adalah agen AI semi-otonom proaktif yang dirancang untuk mendampingi seorang *solo developer* atau profesional teknis. Berjalan tanpa henti (*long-running daemon*) menghubungkan antarmuka **Telegram**, model bahasa besar (LLM), sistem memori persisten bertingkat (**Markdown & SQLite FTS5**), loop detak jantung (**Autonomous Heartbeat**), dan kontrol lalu lintas pesan (**Traffic Controller**).
+Vigil adalah agen AI semi-otonom proaktif berbasis daemon 24/7 di **Telegram** yang dirancang sebagai *personal accountability partner* dan manajer memori jangka panjang. Vigil tidak berperan sebagai alat eksekusi coding, melainkan fokus mendampingi pengorganisasian tugas harian secara mandiri (*task tracking*), mengirimkan pengingat proaktif tanpa menunggu disapa (*proactive nudges*), mencatat memori jangka panjang secara otomatis (**Markdown & SQLite FTS5**), serta menyelenggarakan evaluasi berkala secara disiplin.
 
 ---
 
@@ -32,8 +32,9 @@ graph TD
     subgraph Autonomous Engine
         HB[Heartbeat Runner] -->|Periodic Check| TC
         HB -->|Nudge Dispatch| TI
-        HB -->|Nightly Consolidation| MEM[Memory & Repository]
-        HB -->|Dossier Reconciliation| MEM
+        HB -->|Nightly Consolidation 21:00| MEM[Memory & Repository]
+        HB -->|Silent Extraction 23:30| MEM
+        HB -->|Sunday Reconciliation| MEM
     end
 
     subgraph Storage Layer
@@ -56,18 +57,25 @@ graph TD
 
 ### 2. Hierarchical Memory Architecture
 - **Working Memory (`data/MEMORY.md`)**: Berisi prioritas aktif, status proyek harian, dan fokus saat ini yang selalu diinjeksi ke dalam konteks prompt utama.
-- **User Dossier (`data/USER.md` & SQLite)**: Menyimpan preferensi teknis, kebiasaan (*habit*), identitas, dan komitmen pengguna jangka panjang.
-- **Technical Lab Notes**: Tempat penyimpanan keputusan arsitektur, catatan teknis, dan solusi kode modular.
-- **SQLite FTS5 (Full-Text Search)**: Mesin pencarian teks cepat dengan perankingan BM25 untuk riwayat percakapan dan catatan riset teknis.
+- **User Dossier (`data/USER.md` & SQLite)**: Menyimpan preferensi, kebiasaan (*habit*), identitas, dan komitmen pengguna jangka panjang.
+- **Technical Lab Notes**: Tempat penyimpanan insight teknis, keputusan konfigurasi, dan catatan riset modular.
+- **SQLite FTS5 Multi-Shape Search**: Mesin pencarian teks cepat dengan perankingan BM25 yang mendukung auto-fallback 3 bentuk query (Exact phrase -> AND match -> Individual token OR match) dengan auto-pairing konteks balasan.
 
-### 3. Nightly Consolidation & Sunday Reconciliation
-- **Nightly Memory Evaluation**: Setiap malam setelah pukul 21:00, Vigil mengevaluasi capaian hari itu, merangkum progres, dan merapikan *working memory*.
-- **Sunday Dossier Reconciliation**: Setiap Minggu malam pukul 23:00 (atau otomatis saat item dossier mencapai ≥ 20 item), Vigil memicu rekonsiliasi untuk menggabungkan fakta duplikat, menyelesaikan kontradiksi, dan merapikan format bullet markdown.
+### 3. Background Maintenance & Memory Consolidation
+- **Nightly Memory Evaluation (21:00 WIB)**: Mengevaluasi capaian harian bersama pengguna, merangkum progres, dan memperbarui *working memory*.
+- **Silent Memory Extraction (23:30 WIB)**: Ekstraksi fakta profil dan catatan lab secara mandiri di belakang layar tanpa notifikasi, diproteksi oleh watermark `rowid` SQLite dan Pre-Flight Gate (anti-redundan saat pengguna AFK).
+- **Sunday Dossier Reconciliation (23:00 WIB)**: Konsolidasi mingguan (atau saat item dossier ≥ 20) untuk menggabungkan duplikasi fakta dan menyelesaikan kontradiksi profil.
+- **System Prompt Isolation**: Pipeline pemeliharaan latar belakang (*Silent Extraction* & *Dossier Reconciliation*) 100% terisolasi dari persona santai `SOUL.md` demi objektivitas data dan efisiensi token.
 
-### 4. Deterministic Administrative Menus
+### 4. Temporal Awareness & Sliding-Window Context
+- **Local Timezone Alignment**: Seluruh filter tanggal (`date="YYYY-MM-DD"`, `days_ago=N`) dan tampilan timestamp SQLite diselaraskan secara konsisten ke zona waktu lokal (`config.TIMEZONE`, misal `Asia/Jakarta` / WIB).
+- **User Balloon Timestamps**: Injeksi timestamp lokal `[YYYY-MM-DD HH:MM]` secara eksklusif pada balon pesan `user` di sliding window untuk kesadaran kronologis model tanpa risiko *mimicry*.
+- **Tool Context Retention**: Mempertahankan bukti database `tool_context` non-kosong pada 2 interaksi terbaru di dalam sliding window (anti-amnesia).
+
+### 5. Deterministic Administrative Menus
 - Dashboard interaktif Telegram menggunakan *inline keyboard* bernomor untuk mengelola tugas, catatan lab, fakta profil, dan *working memory* secara langsung tanpa membebani kuota LLM.
 
-### 5. Observability & Diagnostics
+### 6. Observability & Diagnostics
 - **Live Process Tracing**: Menampilkan langkah *reasoning*, pemanggilan tool, dan pembacaan memori secara *live streaming/editing* di chat Telegram.
 - **Token-Dense Eval Logger**: Mencatat setiap sesi interaksi ke file Markdown terstruktur (`logs/agent_eval.md`), khusus dioptimalkan untuk evaluasi kualitas agen tanpa *noise* infrastruktur.
 
@@ -124,8 +132,8 @@ Model berinteraksi dengan dunia luar dan database secara ketat menggunakan tag X
    ```
 
 ### Read Tools (Query Data & Follow-Up Loop)
-1. **Search Lab Notes**: `<search_notes limit="3">2-4 kata kunci</search_notes>`
-2. **Search Chat History**: `<search_chat limit="3">2-4 kata kunci</search_chat>`
+1. **Search Lab Notes**: `<search_notes limit="3" date="YYYY-MM-DD" days_ago="N">1-2 kata kunci teknis (atau kosongkan)</search_notes>`
+2. **Search Chat History**: `<search_chat limit="3" date="YYYY-MM-DD" days_ago="N">1-2 kata kunci topik (atau kosongkan jika pakai filter tanggal)</search_chat>`
 3. **Query Tasks**: `<query_tasks status="pending|in_progress|done|cancelled|all" limit="10"></query_tasks>`
 4. **Get User Dossier**: `<get_dossier limit="5">kategori_opsional</get_dossier>`
 
@@ -252,4 +260,4 @@ source .venv/bin/activate
 PYTHONPATH=. pytest -v
 ```
 
-Total **133 unit & integration test** mencakup evaluasi memori, pemrosesan FTS5, eksekusi tool multi-turn, batas kuota, penanganan sinyal graceful shutdown, dan otorisasi whitelist.
+Total **175 unit & integration test** mencakup evaluasi memori harian, silent memory extraction, isolasi system prompt, pencarian FTS5 multi-shape, sinkronisasi timezone lokal, pemformatan sliding window, eksekusi tool multi-turn, batas kuota, penanganan sinyal graceful shutdown, dan otorisasi whitelist Telegram.
